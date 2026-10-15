@@ -4,8 +4,5 @@
   "type": "module",
   "scripts": {
     "repro": "node repro.mjs"
-  },
-  "dependencies": {
-    "@playwright/test": "1.61.0"
   }
 }

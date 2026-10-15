@@ -1,7 +1,6 @@
-import { chromium } from '@playwright/test';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { readFileSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { mkdtempSync } from 'node:fs';
 import { createServer } from 'node:https';
 import { createServer as createTcpServer } from 'node:net';
@@ -50,6 +49,7 @@ class CdpConnection {
 
   onMessage(listener) {
     this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
   }
 
   close() {
@@ -68,7 +68,7 @@ async function unusedPort() {
 }
 
 async function browserWebSocketUrl(port) {
-  for (let attempt = 0; attempt < 100; attempt++) {
+  for (let attempt = 0; attempt < 200; attempt++) {
     try {
       const response = await fetch(`http://127.0.0.1:${port}/json/version`);
       if (response.ok) return (await response.json()).webSocketDebuggerUrl;
@@ -76,6 +76,35 @@ async function browserWebSocketUrl(port) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error('Chromium remote-debugging endpoint did not become available');
+}
+
+function chromeExecutable() {
+  if (process.env.CHROME_PATH) {
+    if (!existsSync(process.env.CHROME_PATH))
+      throw new Error(`CHROME_PATH does not exist: ${process.env.CHROME_PATH}`);
+    return process.env.CHROME_PATH;
+  }
+  for (const command of ['google-chrome-stable', 'google-chrome', 'chromium', 'chromium-browser']) {
+    try {
+      return execFileSync('which', [command], { encoding: 'utf8' }).trim();
+    } catch {}
+  }
+  throw new Error('Chrome/Chromium was not found; set CHROME_PATH to its executable');
+}
+
+function waitForCdpEvent(cdp, method, sessionId, timeout = 5_000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      unsubscribe();
+      reject(new Error(`Timed out waiting for ${method}`));
+    }, timeout);
+    const unsubscribe = cdp.onMessage((message) => {
+      if (message.method !== method || (sessionId && message.sessionId !== sessionId)) return;
+      clearTimeout(timer);
+      unsubscribe();
+      resolve(message.params);
+    });
+  });
 }
 
 const certificateDirectory = mkdtempSync(join(tmpdir(), 'chromium-sw-body-repro-'));
@@ -171,21 +200,26 @@ const address = server.address();
 const origin = `https://localhost:${address.port}`;
 
 const debugPort = await unusedPort();
-const browser = await chromium.launch({
-  channel: process.env.CHANNEL || 'chromium',
-  headless: true,
-  args: ['--ignore-certificate-errors', `--remote-debugging-port=${debugPort}`, '--remote-allow-origins=*'],
-});
+const profilePath = join(certificateDirectory, 'chrome-profile');
+const browserProcess = spawn(chromeExecutable(), [
+  '--headless=new',
+  '--ignore-certificate-errors',
+  '--no-default-browser-check',
+  '--no-first-run',
+  `--remote-debugging-port=${debugPort}`,
+  '--remote-debugging-address=127.0.0.1',
+  '--remote-allow-origins=*',
+  `--user-data-dir=${profilePath}`,
+  'about:blank',
+], { stdio: 'ignore' });
 const cdp = new CdpConnection(await browserWebSocketUrl(debugPort));
 await cdp.open();
+const browserVersion = await cdp.send('Browser.getVersion');
 await cdp.send('Target.setAutoAttach', {
   autoAttach: true,
   flatten: true,
   waitForDebuggerOnStart: false,
 });
-
-const context = await browser.newContext({ ignoreHTTPSErrors: true });
-const page = await context.newPage();
 
 const responses = new Map();
 const bodyResults = [];
@@ -239,15 +273,36 @@ cdp.onMessage((message) => {
   pendingBodyReads.add(bodyRead);
 });
 
+const { browserContextId } = await cdp.send('Target.createBrowserContext', { disposeOnDetach: true });
+const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank', browserContextId });
+const { sessionId: pageSessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+await Promise.all([
+  cdp.send('Page.enable', {}, pageSessionId),
+  cdp.send('Runtime.enable', {}, pageSessionId),
+]);
+
+async function evaluate(expression) {
+  const result = await cdp.send('Runtime.evaluate', {
+    expression,
+    awaitPromise: true,
+    returnByValue: true,
+  }, pageSessionId);
+  if (result.exceptionDetails)
+    throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
+  return result.result.value;
+}
+
 try {
-  await page.goto(origin);
-  await page.evaluate(() => window.prepare());
+  const pageLoaded = waitForCdpEvent(cdp, 'Page.loadEventFired', pageSessionId);
+  await cdp.send('Page.navigate', { url: origin }, pageSessionId);
+  await pageLoaded;
+  await evaluate('window.prepare()');
   await Promise.race([
     serviceWorkerNetworkReady,
     new Promise((_, reject) => setTimeout(() => reject(new Error('Service-worker CDP Network domain was not enabled')), 5_000)),
   ]);
-  const applicationBodies = await page.evaluate((count) => window.run(count), iterations);
-  await page.waitForTimeout(1_000);
+  const applicationBodies = await evaluate(`window.run(${JSON.stringify(iterations)})`);
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
   await Promise.all(pendingBodyReads);
 
   const expectedBodies = Array.from({ length: iterations }, (_, index) => dataBody(index));
@@ -263,7 +318,7 @@ try {
         result.contentLength === result.expectedBodyLength &&
         result.encodedDataLength > 0 &&
         result.cdpBodyLength === 0),
-    chromiumVersion: browser.version(),
+    chromiumVersion: browserVersion.product,
     origin,
     iterations,
     endpointHits,
@@ -279,8 +334,18 @@ try {
   };
   console.log(JSON.stringify(result, null, 2));
 } finally {
+  await cdp.send('Target.disposeBrowserContext', { browserContextId }).catch(() => {});
   cdp.close();
-  await browser.close();
+  if (browserProcess.exitCode === null) {
+    const browserExited = once(browserProcess, 'exit');
+    browserProcess.kill('SIGTERM');
+    await Promise.race([browserExited, new Promise((resolve) => setTimeout(resolve, 2_000))]);
+  }
+  if (browserProcess.exitCode === null) {
+    const browserExited = once(browserProcess, 'exit');
+    browserProcess.kill('SIGKILL');
+    await browserExited;
+  }
   server.close();
-  rmSync(certificateDirectory, { recursive: true, force: true });
+  rmSync(certificateDirectory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }
