@@ -11,6 +11,10 @@ import { join } from 'node:path';
 const iterations = Number(process.env.ITERATIONS ?? 10);
 let endpointHits = 0;
 
+function dataBody(index) {
+  return JSON.stringify({ index: String(index), padding: 'x'.repeat(1_300) });
+}
+
 class CdpConnection {
   constructor(url) {
     this.nextId = 0;
@@ -103,19 +107,21 @@ const pageHtml = String.raw`<!doctype html>
 <meta charset="utf-8">
 <title>Service worker response-body CDP reproduction</title>
 <script>
-  window.run = async count => {
+  window.prepare = async () => {
     const registration = await navigator.serviceWorker.register('/sw.js');
     await navigator.serviceWorker.ready;
     if (!navigator.serviceWorker.controller) {
       await new Promise(resolve => navigator.serviceWorker.addEventListener('controllerchange', resolve, { once: true }));
     }
+  };
 
-    const lengths = [];
+  window.run = async count => {
+    const bodies = [];
     for (let index = 0; index < count; index++) {
       const response = await fetch('/data?index=' + index);
-      lengths.push((await response.text()).length);
+      bodies.push(await response.text());
     }
-    return lengths;
+    return bodies;
   };
 </script>`;
 
@@ -146,7 +152,7 @@ const server = createServer(
     }
     if (url.pathname === '/data') {
       endpointHits++;
-      const body = JSON.stringify({ index: url.searchParams.get('index'), padding: 'x'.repeat(1_300) });
+      const body = dataBody(url.searchParams.get('index'));
       response.writeHead(200, {
         'content-type': 'application/json',
         'cache-control': 'no-store',
@@ -185,11 +191,15 @@ const responses = new Map();
 const bodyResults = [];
 const pendingBodyReads = new Set();
 const serviceWorkerSessions = new Set();
+let resolveServiceWorkerNetworkReady;
+const serviceWorkerNetworkReady = new Promise((resolve) => {
+  resolveServiceWorkerNetworkReady = resolve;
+});
 
 cdp.onMessage((message) => {
   if (message.method === 'Target.attachedToTarget' && message.params.targetInfo.type === 'service_worker') {
     serviceWorkerSessions.add(message.params.sessionId);
-    void cdp.send('Network.enable', {}, message.params.sessionId);
+    void cdp.send('Network.enable', {}, message.params.sessionId).then(resolveServiceWorkerNetworkReady);
     return;
   }
 
@@ -211,10 +221,14 @@ cdp.onMessage((message) => {
   const bodyRead = cdp
     .send('Network.getResponseBody', { requestId: message.params.requestId }, message.sessionId)
     .then((body) => {
+      const contentLength = Object.entries(responseEvent.response.headers)
+        .find(([name]) => name.toLowerCase() === 'content-length')?.[1];
+      const requestIndex = new URL(responseEvent.response.url).searchParams.get('index');
       bodyResults.push({
         requestId: message.params.requestId,
         encodedDataLength: message.params.encodedDataLength,
-        contentLength: responseEvent.response.headers['Content-Length'],
+        contentLength: Number(contentLength),
+        expectedBodyLength: Buffer.byteLength(dataBody(requestIndex)),
         cdpBodyLength: Buffer.byteLength(body.body, body.base64Encoded ? 'base64' : 'utf8'),
       });
     })
@@ -227,22 +241,36 @@ cdp.onMessage((message) => {
 
 try {
   await page.goto(origin);
-  const applicationBodyLengths = await page.evaluate((count) => window.run(count), iterations);
+  await page.evaluate(() => window.prepare());
+  await Promise.race([
+    serviceWorkerNetworkReady,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('Service-worker CDP Network domain was not enabled')), 5_000)),
+  ]);
+  const applicationBodies = await page.evaluate((count) => window.run(count), iterations);
   await page.waitForTimeout(1_000);
   await Promise.all(pendingBodyReads);
+
+  const expectedBodies = Array.from({ length: iterations }, (_, index) => dataBody(index));
+  const applicationBodiesMatch = applicationBodies.every((body, index) => body === expectedBodies[index]);
 
   const result = {
     bugReproduced:
       endpointHits === iterations &&
-      applicationBodyLengths.every((length) => length > 0) &&
+      applicationBodies.length === iterations &&
+      applicationBodiesMatch &&
       bodyResults.length === iterations &&
-      bodyResults.every((result) => result.encodedDataLength > 0 && result.cdpBodyLength === 0),
+      bodyResults.every((result) =>
+        result.contentLength === result.expectedBodyLength &&
+        result.encodedDataLength > 0 &&
+        result.cdpBodyLength === 0),
     chromiumVersion: browser.version(),
     origin,
     iterations,
     endpointHits,
-    applicationResponses: applicationBodyLengths.length,
-    applicationEmptyBodies: applicationBodyLengths.filter((length) => length === 0).length,
+    endpointHitsMatchApplicationRequests: endpointHits === iterations,
+    applicationResponses: applicationBodies.length,
+    applicationBodiesMatchServerBodies: applicationBodiesMatch,
+    applicationEmptyBodies: applicationBodies.filter((body) => body.length === 0).length,
     serviceWorkerSessions: serviceWorkerSessions.size,
     cdpResponses: bodyResults.length,
     cdpEmptyBodies: bodyResults.filter((result) => result.cdpBodyLength === 0).length,
